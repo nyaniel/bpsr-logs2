@@ -5,11 +5,17 @@ use crate::packets::utils::{BinaryReader, Server, TCPReassembler};
 use etherparse::NetSlice::Ipv4;
 use etherparse::SlicedPacket;
 use etherparse::TransportSlice::Tcp;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use once_cell::sync::OnceCell;
 use std::hash::Hash;
 use tokio::sync::watch;
+
+#[cfg(target_os = "linux")]
+use pcap::{Capture, Device, Active};
+
+#[cfg(target_os = "windows")]
 use windivert::WinDivert;
+#[cfg(target_os = "windows")]
 use windivert::prelude::WinDivertFlags;
 
 // Global sender for restart signal
@@ -35,6 +41,7 @@ pub fn start_capture() -> tokio::sync::mpsc::Receiver<(packets::opcodes::Pkt, Ve
     packet_receiver
 }
 
+#[cfg(target_os = "windows")]
 #[allow(clippy::too_many_lines)]
 async fn read_packets(
     packet_sender: &tokio::sync::mpsc::Sender<(packets::opcodes::Pkt, Vec<u8>)>,
@@ -254,6 +261,279 @@ async fn read_packets(
         }
     } // todo: if it errors, it breaks out of the loop but will it ever error?
     // info!("{}", line!());
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
+async fn read_packets(
+    packet_sender: &tokio::sync::mpsc::Sender<(packets::opcodes::Pkt, Vec<u8>)>,
+    restart_receiver: &mut watch::Receiver<bool>,
+) {
+    // Pick NIC from env (BPSR_INTERFACE=eth0), else default
+    let device = if let Ok(name) = std::env::var("BPSR_INTERFACE") {
+        match Device::list().ok().and_then(|v| v.into_iter().find(|d| d.name == name)) {
+            Some(dev) => dev,
+            None => {
+                warn!("BPSR_INTERFACE='{}' not found, falling back to default device", name);
+                match Device::lookup() {
+                    Ok(Some(dev)) => dev,
+                    _ => {
+                        error!("No default network device found");
+                        return;
+                    }
+                }
+            }
+        }
+    } else {
+        match Device::lookup() {
+            Ok(Some(dev)) => dev,
+            _ => {
+                error!("No default network device found");
+                return;
+            }
+        }
+    };
+
+    info!("Using network device: {:?}", device.name);
+
+    // Create packet capture
+    let mut cap = match Capture::from_device(device) {
+        Ok(cap) => match cap
+            .promisc(false)
+            .snaplen(65535)
+            .timeout(1000)
+            .open()
+        {
+            Ok(active) => active,
+            Err(e) => {
+                error!("Failed to open capture: {}", e);
+                return;
+            }
+        },
+        Err(e) => {
+            error!("Failed to create capture from device: {}", e);
+            return;
+        }
+    };
+
+    // Set BPF filter for TCP packets only
+    if let Err(e) = cap.filter("tcp", true) {
+        error!("Failed to set BPF filter: {}", e);
+        return;
+    }
+
+    let linktype = cap.get_datalink();
+    info!("Packet capture started on Linux! Linktype: {:?}", linktype);
+
+    let mut known_server: Option<Server> = None;
+    let mut tcp_reassembler: TCPReassembler = TCPReassembler::new();
+
+    loop {
+        // Check for restart signal
+        if *restart_receiver.borrow() {
+            break;
+        }
+
+        match cap.next_packet() {
+            Ok(packet) => {
+                // Parse robustly for different link-layer types
+                let network_slices = match linktype.0 {
+                    1 /* EN10MB (Ethernet) */ => SlicedPacket::from_ethernet(packet.data),
+                    12 /* RAW IP */ => SlicedPacket::from_ip(packet.data),
+                    113 /* Linux SLL v1 */ => {
+                        if packet.data.len() <= 16 { continue; }
+                        SlicedPacket::from_ip(&packet.data[16..])
+                    }
+                    276 /* Linux SLL v2 */ => {
+                        if packet.data.len() <= 20 { continue; }
+                        SlicedPacket::from_ip(&packet.data[20..])
+                    }
+                    _ => {
+                        // Try Ethernet then IP as fallback
+                        SlicedPacket::from_ethernet(packet.data)
+                            .or_else(|_| SlicedPacket::from_ip(packet.data))
+                    }
+                };
+
+                let Ok(network_slices) = network_slices else {
+                    continue;
+                };
+
+                let Some(Ipv4(ip_packet)) = network_slices.net else {
+                    continue;
+                };
+
+                let Some(Tcp(tcp_packet)) = network_slices.transport else {
+                    continue;
+                };
+
+                let curr_server = Server::new(
+                    ip_packet.header().source(),
+                    tcp_packet.to_header().source_port,
+                    ip_packet.header().destination(),
+                    tcp_packet.to_header().destination_port,
+                );
+
+                // 1. Try to identify game server via small packets
+                if known_server != Some(curr_server) {
+                    let tcp_payload = tcp_packet.payload();
+                    
+                    // 1. 5th byte from offset = Scene change?
+                    let mut tcp_payload_reader = BinaryReader::from(tcp_payload.to_vec());
+                    if tcp_payload_reader.remaining() >= 10
+                        && tcp_payload_reader.read_bytes(10).unwrap()[4] == 0
+                    {
+                        const FRAG_LENGTH_SIZE: usize = 4;
+                        const SIGNATURE: [u8; 6] = [0x00, 0x63, 0x33, 0x53, 0x42, 0x00];
+
+                        let mut i = 0;
+                        while tcp_payload_reader.remaining() >= FRAG_LENGTH_SIZE {
+                            i += 1;
+                            if i > 1000 {
+                                info!("Line: {} - Stuck at 1. Try to identify game server via small packets?", line!());
+                                break;
+                            }
+
+                            let tcp_frag_payload_len = tcp_payload_reader
+                                .read_u32()
+                                .unwrap()
+                                .saturating_sub(FRAG_LENGTH_SIZE as u32)
+                                as usize;
+
+                            if tcp_payload_reader.remaining() >= tcp_frag_payload_len {
+                                let tcp_frag = tcp_payload_reader
+                                    .read_bytes(tcp_frag_payload_len)
+                                    .unwrap();
+
+                                if tcp_frag.len() >= 5 + SIGNATURE.len()
+                                    && tcp_frag[5..5 + SIGNATURE.len()] == SIGNATURE
+                                {
+                                    info!("Got Scene Server Address (by change): {curr_server}");
+                                    known_server = Some(curr_server);
+                                    tcp_reassembler.clear_reassembler(
+                                        tcp_packet.sequence_number() as usize
+                                            + tcp_payload_reader.len(),
+                                    );
+                                    if let Err(err) = packet_sender
+                                        .send((Pkt::ServerChangeInfo, Vec::new()))
+                                        .await
+                                    {
+                                        debug!("Failed to send packet: {err}");
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    // 2. Payload length is 98 = Login packets?
+                    if tcp_payload.len() == 98 {
+                        const SIGNATURE_1: [u8; 10] =
+                            [0x00, 0x00, 0x00, 0x62, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01];
+                        const SIGNATURE_2: [u8; 6] = [0x00, 0x00, 0x00, 0x00, 0x0a, 0x4e];
+
+                        if tcp_payload.len() >= 20
+                            && tcp_payload[0..10] == SIGNATURE_1
+                            && tcp_payload[14..20] == SIGNATURE_2
+                        {
+                            info!("Got Scene Server Address by Login Return Packet: {curr_server}");
+                            known_server = Some(curr_server);
+                            tcp_reassembler.clear_reassembler(
+                                tcp_packet.sequence_number() as usize + tcp_payload.len(),
+                            );
+                            if let Err(err) = packet_sender
+                                .send((Pkt::ServerChangeInfo, Vec::new()))
+                                .await
+                            {
+                                debug!("Failed to send packet: {err}");
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // 2. TCP Reassembly
+                if tcp_reassembler.next_seq.is_none() {
+                    tcp_reassembler.next_seq = Some(tcp_packet.sequence_number() as usize);
+                }
+
+                if tcp_reassembler
+                    .next_seq
+                    .unwrap()
+                    .saturating_sub(tcp_packet.sequence_number() as usize)
+                    == 0
+                {
+                    tcp_reassembler.cache.insert(
+                        tcp_packet.sequence_number() as usize,
+                        Vec::from(tcp_packet.payload()),
+                    );
+                }
+
+                let mut i = 0;
+                while tcp_reassembler
+                    .cache
+                    .contains_key(&tcp_reassembler.next_seq.unwrap())
+                {
+                    i += 1;
+                    if i > 1000 {
+                        info!("Line: {} - Stuck at TCP reassembly cache processing?", line!());
+                        break;
+                    }
+
+                    let seq = &tcp_reassembler.next_seq.unwrap();
+                    let cached_tcp_data = tcp_reassembler.cache.get(seq).unwrap();
+                    if tcp_reassembler._data.is_empty() {
+                        tcp_reassembler._data = cached_tcp_data.clone();
+                    } else {
+                        tcp_reassembler._data.extend_from_slice(cached_tcp_data);
+                    }
+
+                    tcp_reassembler.next_seq = Some(seq.wrapping_add(cached_tcp_data.len()));
+                    tcp_reassembler.cache.remove(seq);
+                }
+
+                i = 0;
+                while tcp_reassembler._data.len() > 4 {
+                    i += 1;
+                    if i > 1000 {
+                        info!("Line: {} - Stuck at while tcp_reassembler._data.len() > 4?", line!());
+                        break;
+                    }
+
+                    let packet_size = BinaryReader::from(tcp_reassembler._data.clone())
+                        .read_u32()
+                        .unwrap();
+                    if tcp_reassembler._data.len() < packet_size as usize {
+                        break;
+                    }
+
+                    if tcp_reassembler._data.len() >= packet_size as usize {
+                        let (left, right) = tcp_reassembler._data.split_at(packet_size as usize);
+                        let packet = left.to_vec();
+                        tcp_reassembler._data = right.to_vec();
+                        
+                        process_packet(BinaryReader::from(packet), packet_sender.clone()).await;
+                    }
+                }
+
+                // Periodically check for restart signal
+                if *restart_receiver.borrow() {
+                    break;
+                }
+            }
+            Err(pcap::Error::TimeoutExpired) => {
+                // Timeout is normal, just continue
+                continue;
+            }
+            Err(e) => {
+                warn!("Error reading packet: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    info!("Packet capture stopped");
 }
 
 // Function to send restart signal from another thread/task

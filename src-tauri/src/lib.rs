@@ -7,7 +7,6 @@ use crate::live::opcodes_models::EncounterMutex;
 use log::{error, info, warn};
 use specta_typescript::{BigIntExportBehavior, Typescript};
 use std::process::Command;
-use window_vibrancy::apply_blur;
 
 use chrono_tz;
 use tauri::menu::{Menu, MenuBuilder, MenuItem};
@@ -65,13 +64,17 @@ pub fn run() {
             // https://v2.tauri.app/plugin/updater/#checking-for-updates
             #[cfg(not(debug_assertions))] // <- Only check for updates on release builds
             {
-                stop_windivert();
-                remove_windivert();
+                #[cfg(target_os = "windows")]
+                {
+                    stop_windivert();
+                    remove_windivert();
+                }
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     crate::update(handle).await.unwrap();
                 });
             }
+
 
             let app_handle = app.handle().clone();
 
@@ -98,6 +101,7 @@ pub fn run() {
     build_and_run(tauri_builder);
 }
 
+#[cfg(target_os = "windows")]
 fn start_windivert() {
     let status = Command::new("sc").args(["create", "windivert", "type=", "kernel", "binPath=", "WinDivert64.sys", "start=", "demand"]).status();
     if status.is_ok_and(|status| status.success()) {
@@ -107,6 +111,7 @@ fn start_windivert() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn stop_windivert() {
     let status = Command::new("sc").args(["stop", "windivert"]).status();
     if status.is_ok_and(|status| status.success()) {
@@ -116,6 +121,7 @@ fn stop_windivert() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn remove_windivert() {
     let status = Command::new("sc").args(["delete", "windivert", "start=", "demand"]).status();
     if status.is_ok_and(|status| status.success()) {
@@ -239,6 +245,7 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 live_meter_window.set_ignore_cursor_events(false).unwrap();
             }
             "quit" => {
+                #[cfg(target_os = "windows")]
                 stop_windivert();
                 tray_app.exit(0);
             }

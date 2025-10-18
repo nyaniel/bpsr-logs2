@@ -8,6 +8,7 @@ use blueprotobuf_lib::blueprotobuf::EEntityType;
 use log::info;
 use tauri::Manager;
 use tauri_plugin_clipboard_manager::ClipboardExt;
+#[cfg(target_os = "windows")]
 use window_vibrancy::{apply_blur, clear_blur};
 use crate::packets::packet_capture::request_restart;
 
@@ -32,16 +33,22 @@ fn nan_is_zero(value: f64) -> f64 {
 #[tauri::command]
 #[specta::specta]
 pub fn enable_blur(app: tauri::AppHandle) {
-    if let Some(meter_window) = app.get_webview_window(WINDOW_LIVE_LABEL) {
-        apply_blur(&meter_window, Some((10, 10, 10, 50))).ok();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(meter_window) = app.get_webview_window(WINDOW_LIVE_LABEL) {
+            apply_blur(&meter_window, Some((10, 10, 10, 50))).ok();
+        }
     }
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn disable_blur(app: tauri::AppHandle) {
-    if let Some(meter_window) = app.get_webview_window(WINDOW_LIVE_LABEL) {
-        clear_blur(&meter_window).ok();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(meter_window) = app.get_webview_window(WINDOW_LIVE_LABEL) {
+            clear_blur(&meter_window).ok();
+        }
     }
 }
 

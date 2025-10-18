@@ -1,6 +1,7 @@
 use tauri::generate_context;
 use tauri::Builder as TauriBuilder;
 use log::info;
+#[cfg(target_os = "windows")]
 use crate::stop_windivert;
 
 // https://discord.com/channels/616186924390023171/1400593249063927960/1400593249063927960
@@ -11,6 +12,7 @@ pub fn build_and_run(builder: TauriBuilder<tauri::Wry>) {
         .expect("error while running tauri application")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                #[cfg(target_os = "windows")]
                 stop_windivert();
                 info!("App is closing! Cleaning up resources...");
             }

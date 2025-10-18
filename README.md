@@ -9,9 +9,45 @@ BPSR Logs is a "blazingly fast" open source Blue Protocol: Star Resonance DPS me
 
 # Download
 
+## Windows
 https://github.com/winjwinj2/bpsr-logs/releases/latest
 
 \*currently only Windows 7 and up is supported
+
+## Linux
+
+### Prerequisites
+
+Install libpcap development package:
+
+```bash
+# Arch Linux / Manjaro
+sudo pacman -S libpcap
+
+# Debian / Ubuntu
+sudo apt install libpcap-dev
+
+# Fedora / RHEL
+sudo dnf install libpcap-devel
+```
+
+### Building and Running
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+1. Build and run in development mode:
+   ```bash
+   npm run tauri dev
+   ```
+
+1. Grant packet capture capabilities (required after each build):
+   ```bash
+   sudo setcap cap_net_raw,cap_net_admin=eip ./src-tauri/target/debug/bpsr-logs
+   ```
+
+###
 
 # Is it safe?
 

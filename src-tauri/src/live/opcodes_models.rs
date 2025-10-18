@@ -3,7 +3,9 @@ use blueprotobuf_lib::blueprotobuf::{EEntityType, SyncContainerData};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+#[cfg(target_os = "windows")]
 use windivert::WinDivert;
+#[cfg(target_os = "windows")]
 use windivert::layer::NetworkLayer;
 
 #[derive(Debug, Default, Clone)]
